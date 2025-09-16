@@ -1,393 +1,491 @@
-# -*- coding: utf-8 -*-
-# 실행: streamlit run --server.port 3000 --server.address 0.0.0.0 streamlit_app.py
+# streamlit_app.py
+"""
+Streamlit 대시보드 (한국어 UI)
+- 공개 데이터 대시보드: OpenAQ (실시간/역사적 대기질), World Bank (연평균 PM2.5) 활용 예시
+  - OpenAQ API: https://api.openaq.org/ (Docs: https://docs.openaq.org/resources/measurements) . Refer: turn0search0, turn0search6, turn0search9
+  - World Bank PM2.5 indicator: EN.ATM.PM25.MC.M3 (Data page: https://data.worldbank.org/indicator/EN.ATM.PM25.MC.M3). Refer: turn0search1, turn0search4
+  - WHO Ambient Air Quality Database: https://www.who.int/data/gho/data/themes/air-pollution/who-air-quality-database. Refer: turn0search2, turn0search5
+- 사용자 입력(프롬프트 텍스트) 대시보드: 제공된 보고서 본문(입력 섹션)을 기반으로 교실별 예시 실내/실외 PM2.5 데이터 생성 및 시각화 (앱 실행 중 파일 업로드 불필요)
+- 구현 규칙 준수:
+  - 표준화 컬럼: date, value, group (옵션)
+  - @st.cache_data 사용
+  - 미래 데이터(로컬 자정 이후) 제거
+  - API 실패 시 예시 데이터로 자동 대체 & 화면 안내
+  - 전처리된 표 CSV 다운로드 제공
+- 폰트: /fonts/Pretendard-Bold.ttf 적용 시도 (없으면 자동 생략)
+"""
 
-import datetime
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
+from __future__ import annotations
 import streamlit as st
-import xarray as xr
+import pandas as pd
+import numpy as np
+import requests
+import io
+from datetime import datetime, timedelta, timezone
+import pytz
+from dateutil import parser
 
-# --- 안전한 Matplotlib/폰트 설정 ---
-import matplotlib
-import matplotlib.pyplot as plt
-from matplotlib import font_manager as fm, rcParams
-from matplotlib.colors import TwoSlopeNorm
-import matplotlib.patheffects as pe
-import matplotlib.patches as patches
+import plotly.express as px
 
-# --- Cartopy는 환경에 따라 설치 실패 가능 → 옵셔널 로딩 ---
-USE_CARTOPY = True
-try:
-    import cartopy.crs as ccrs
-    import cartopy.feature as cfeature
-except Exception:
-    USE_CARTOPY = False
+# ---------------------------
+# 기본 설정 (한국어)
+# ---------------------------
+st.set_page_config(page_title="실내 vs 실외 공기질 대시보드", layout="wide")
 
-# -------------------------------------------------
-# 전역 스타일/폰트
-# -------------------------------------------------
-def setup_font():
-    """Pretendard 없으면 서버 기본 한글 폰트 후보로 폴백."""
-    font_path = Path(__file__).parent / "fonts" / "Pretendard-Bold.ttf"
-    if font_path.exists():
-        fm.fontManager.addfont(str(font_path))
-        font_name = fm.FontProperties(fname=str(font_path)).get_name()
-        rcParams["font.family"] = font_name
-    else:
-        # 서버/도커에서 흔한 한글 폰트 후보
-        for cand in ["NanumGothic", "Noto Sans CJK KR", "AppleGothic"]:
-            try:
-                rcParams["font.family"] = cand
-                break
-            except Exception:
-                pass
-    rcParams["axes.unicode_minus"] = False
-    rcParams["axes.spines.top"] = False
-    rcParams["axes.spines.right"] = False
-    rcParams["axes.grid"] = True
-    rcParams["grid.alpha"] = 0.25
-
-setup_font()
-PE = [pe.withStroke(linewidth=2.5, foreground="white")]
-
-st.set_page_config(page_title="뜨거워지는 바다: SST 대시보드", layout="wide", page_icon="🌊")
-
-# -------------------------------------------------
-# NOAA OISST v2 High-Res (0.25°) 일일 데이터 (연도별 파일)
-# -------------------------------------------------
-BASE_URL = "https://psl.noaa.gov/thredds/dodsC/Datasets/noaa.oisst.v2.highres/sst.day.mean.{year}.nc"
-
-# -------------------------------------------------
-# 데이터 로더: 'nearest + tolerance' + 연-경계/폴백 탐색 + 캐시
-# -------------------------------------------------
-@st.cache_data(show_spinner=False, ttl=3600)
-def load_sst(date: datetime.date, lat_range=(28, 42), lon_range=(120, 135)):
+# Attempt to load local Pretendard font for Streamlit/Plotly/Matplotlib
+def inject_pretendard_css():
     """
-    - 선택 날짜가 time index에 정확히 없을 때 발생하는
-      "not all values found in index 'time' ..." 문제에 대응
-    - 1) nearest + tolerance(3일) → 2) 7일 범위에서 과거로 폴백 탐색
-    - 연도 경계 자동 처리
-    - 반환: (DataArray, 실제사용날짜date) 또는 (None, None)
+    시도: Pretendard-Bold.ttf를 /fonts 폴더에서 불러와 CSS로 적용
+    (없으면 자연스럽게 무시됨)
     """
-
-    def _open_year(y: int):
-        url = BASE_URL.format(year=y)
-        # pydap 미설치 환경이 많으므로 기본엔진 → 실패 시 pydap
-        try:
-            ds = xr.open_dataset(url)  # netCDF4/OPeNDAP 자동
-        except Exception:
-            ds = xr.open_dataset(url, engine="pydap")
-        return ds.sortby("time")
-
     try:
-        ds_main = _open_year(date.year)
-
-        # 1) 가까운 날짜 자동 선택 (허용오차 3일)
-        try:
-            da = (
-                ds_main["sst"]
-                .sel(time=np.datetime64(date), method="nearest", tolerance=np.timedelta64(3, "D"))
-                .sel(lat=slice(*lat_range), lon=slice(*lon_range))
-                .squeeze()
+        import os
+        font_path = "/fonts/Pretendard-Bold.ttf"
+        if os.path.exists(font_path):
+            # CSS 적용 (Streamlit 마진 내)
+            st.markdown(
+                f"""
+                <style>
+                @font-face {{
+                    font-family: 'Pretendard';
+                    src: url('file://{font_path}') format('truetype');
+                    font-weight: 700;
+                    font-style: normal;
+                }}
+                html, body, [class*="css"]  {{
+                    font-family: 'Pretendard', sans-serif;
+                }}
+                </style>
+                """,
+                unsafe_allow_html=True,
             )
-            da.load()
-            if np.isfinite(da.values).any():
-                used_date = pd.to_datetime(da["time"].item()).date()
-                return da, used_date
-        except Exception:
+            # Plotly 글꼴 기본값 설정 (각 그래프에서 layout.font.family로 재설정 가능)
+        else:
+            # 파일 없으면 그냥 통과
             pass
+    except Exception:
+        pass
 
-        # 2) 실패 시 7일 동안 과거로 하루씩 물러나며 탐색 (연도 경계 포함)
-        for back in range(1, 8):
-            dt = date - datetime.timedelta(days=back)
-            ds = ds_main if dt.year == date.year else _open_year(dt.year)
-            try:
-                da = (
-                    ds["sst"]
-                    .sel(time=np.datetime64(dt))  # 정확 일치 시도
-                    .sel(lat=slice(*lat_range), lon=slice(*lon_range))
-                    .squeeze()
-                )
-                da.load()
-                if np.isfinite(da.values).any():
-                    used_date = pd.to_datetime(da["time"].item()).date()
-                    return da, used_date
-            except Exception:
-                continue
+inject_pretendard_css()
 
-        return None, None
+# Helper: Asia/Seoul today (local)
+SEOUL_TZ = pytz.timezone("Asia/Seoul")
+def seoul_today_date() -> datetime.date:
+    return datetime.now(SEOUL_TZ).date()
 
-    except Exception as e:
-        st.error(f"데이터 불러오기 실패: {e}")
-        return None, None
-
-# -------------------------------------------------
-# 플로팅 (Cartopy 있으면 지도 투영, 없으면 평면 대체)
-# -------------------------------------------------
-def plot_sst(da, date, extent=(120, 135, 28, 42)):
-    # 계절/날짜 변화에 안전한 컬러 스케일
-    arr = da.values
-    if not np.isfinite(arr).any():
-        raise ValueError("SST 값이 모두 NaN입니다.")
-
-    vmin = float(np.nanpercentile(arr, 5))
-    vmax = float(np.nanpercentile(arr, 95))
-    # 시인성 좋은 중심값(따뜻한 계절 가중) 또는 중간값
-    vcenter = min(max(29.0, vmin + (vmax - vmin) * 0.6), vmax - 0.1)
-    norm = TwoSlopeNorm(vmin=vmin, vcenter=vcenter, vmax=vmax)
-
-    if USE_CARTOPY:
-        fig, ax = plt.subplots(figsize=(9, 6), subplot_kw={"projection": ccrs.PlateCarree()})
-        ax.set_extent(extent, crs=ccrs.PlateCarree())
-        im = da.plot.pcolormesh(
-            ax=ax, x="lon", y="lat",
-            transform=ccrs.PlateCarree(),
-            cmap="YlOrRd", norm=norm, add_colorbar=False
-        )
-        ax.coastlines()
-        ax.add_feature(cfeature.LAND, facecolor="lightgray")
-        ax.add_feature(cfeature.BORDERS, linewidth=0.5)
-    else:
-        # Cartopy 미사용 평면 대체 (환경 호환 모드)
-        fig, ax = plt.subplots(figsize=(9, 6))
-        im = da.plot.pcolormesh(
-            ax=ax, x="lon", y="lat",
-            cmap="YlOrRd", norm=norm, add_colorbar=False
-        )
-        ax.set_xlim(extent[0], extent[1])
-        ax.set_ylim(extent[2], extent[3])
-        ax.set_xlabel("경도")
-        ax.set_ylabel("위도")
-        ax.grid(alpha=0.25)
-        st.info("지도가 간소화된 평면 모드로 표시되었습니다 (Cartopy 미사용).", icon="ℹ️")
-
-    cbar = fig.colorbar(im, ax=ax, orientation="vertical", pad=0.05)
-    cbar.set_label("해수면 온도 (℃)")
-    ax.set_title(f"해수면 온도: {date.strftime('%Y-%m-%d')}")
-    return fig
-
-# -------------------------------------------------
-# 미니 차트 유틸 (Bullet / Lollipop / Combo / Waffle)
-# -------------------------------------------------
-def bullet(ax, value, target, label="", color="#F28E2B"):
-    lo, hi = min(value, target), max(value, target)
-    pad = (hi - lo) * 0.5 + 0.5
-    vmin, vmax = lo - pad, hi + pad
-    ax.barh([0], [vmax - vmin], left=vmin, color="#EEEEEE", height=0.36)
-    ax.barh([0], [value - vmin], left=vmin, color=color, height=0.36)
-    ax.axvline(target, color="#333333", lw=2.2)
-    ax.set_yticks([]); ax.set_xlim(vmin, vmax); ax.set_xlabel("℃"); ax.set_title(label)
-    delta = value - target
-    badge = f"+{delta:.1f}℃" if delta >= 0 else f"{delta:.1f}℃"
-    ax.text(value, 0.1, f"{value:.1f}℃", ha="left", va="bottom", weight="bold", path_effects=PE)
-    ax.text(0.02, 0.9, badge, transform=ax.transAxes,
-            fontsize=12, weight="bold", color="white", path_effects=PE,
-            bbox=dict(boxstyle="round,pad=0.35",
-                      facecolor="#C1272D" if delta>=0 else "#2B7A78",
-                      edgecolor="none"))
-
-def lollipop_horizontal(ax, labels, values, title, unit="℃", color="#4C78A8", highlight_color="#E45756"):
-    idx = np.argsort(values)[::-1]
-    labels_sorted = [labels[i] for i in idx]
-    values_sorted = [values[i] for i in idx]
-    y = np.arange(len(labels_sorted))
-    ax.hlines(y, [0]*len(values_sorted), values_sorted, color="#CCCCCC", lw=3)
-    vmax_i = int(np.argmax(values_sorted))
-    for i, v in enumerate(values_sorted):
-        col = highlight_color if i == vmax_i else color
-        ax.plot(v, y[i], "o", ms=10, mfc=col, mec=col)
-        ax.text(v + max(values_sorted)*0.03, y[i],
-                f"{v:.2f}{unit}" if unit.endswith("년") else f"{v:.1f}{unit}",
-                va="center", weight="bold" if i == vmax_i else 500, color=col, path_effects=PE)
-    ax.set_yticks(y, labels_sorted); ax.set_xlabel(unit); ax.set_title(title); ax.grid(axis="x", alpha=0.25)
-
-def combo_bar_line(ax, x_labels, bars, line, bar_color="#FDB863", line_color="#C1272D"):
-    x = np.arange(len(x_labels))
-    ax.bar(x, bars, color=bar_color, width=0.55)
-    ax.set_xticks(x, x_labels); ax.set_ylabel("총 환자 수(명)")
-    ax2 = ax.twinx()
-    ax2.plot(x, line, marker="o", ms=7, lw=2.5, color=line_color)
-    ax2.set_ylabel("총 사망자 수(명)", color=line_color)
-
-def waffle(ax, percent, rows=10, cols=10, on="#F03B20", off="#EEEEEE", title=None):
-    total = rows*cols
-    k = int(round(percent/100*total))
-    for i in range(total):
-        r = i // cols; c = i % cols
-        color = on if i < k else off
-        rect = patches.Rectangle((c, rows-1-r), 0.95, 0.95, facecolor=color, edgecolor="white")
-        ax.add_patch(rect)
-    ax.set_xlim(0, cols); ax.set_ylim(0, rows); ax.axis("off")
-    if title: ax.set_title(title)
-    ax.text(cols/2, rows/2, f"{percent:.0f}%", ha="center", va="center",
-            fontsize=20, weight="bold", color="#333", path_effects=PE)
-
-# -------------------------------------------------
-# 본문 UI
-# -------------------------------------------------
-st.title("🌊 뜨거워지는 지구: 해수면 온도 상승이 고등학생에게 미치는 영향")
-
-st.header("I. 서론: 뜨거워지는 바다, 위협받는 교실")
-st.markdown("""
-한반도는 지구 평균보다 2~3배 빠른 해수면 온도 상승을 겪고 있으며, 이는 더 이상 추상적인 환경 문제가 아니라
-미래 세대의 학습권과 건강을 직접적으로 위협하는 현실입니다. 본 보고서는 고등학생을 기후 위기의 가장 취약한 집단이자
-변화의 핵심 동력으로 조명하며, 해수면 온도(SST) 상승의 실태와 파급효과를 다각도로 분석합니다.
-""")
-
-st.header("II. 조사 계획")
-st.subheader("1) 조사 기간")
-st.markdown("2025년 7월 ~ 2025년 8월")
-st.subheader("2) 조사 방법과 대상")
-st.markdown("""
-- **데이터 분석**: NOAA OISST v2 High Resolution Dataset  
-- **문헌 조사**: 기상청, 연구 논문, 보도자료 등  
-- **대상**: 대한민국 고등학생의 건강·학업·사회경제적 영향
-""")
-
-st.header("III. 조사 결과")
-st.subheader("1) 한반도 주변 해수면 온도 상황")
-
-# 날짜 기본값: 매우 최신은 공란일 수 있으므로 D-2
-today = datetime.date.today()
-default_date = min(today - datetime.timedelta(days=2), today)  # 미래 선택 방지
-date = st.date_input("날짜 선택", value=default_date, max_value=today)
-
-with st.spinner("데이터 불러오는 중..."):
-    da, used_date = load_sst(date)
-
-if da is not None:
-    st.pyplot(plot_sst(da, used_date), clear_figure=True)
-    if used_date != date:
-        st.caption(f"선택 날짜에 데이터가 없어 **{used_date.strftime('%Y-%m-%d')}** 자료로 대체했습니다.")
-else:
-    st.warning("해당 기간에 유효한 데이터를 찾지 못했습니다. 날짜를 바꿔보세요.")
-
-# ----------------------- 인포 차트들 -----------------------
-st.subheader("📈 최근 기록과 평년 대비 편차 (예시)")
-c1, c2, c3 = st.columns(3)
-with c1:
-    fig, ax = plt.subplots(figsize=(5,2.6))
-    bullet(ax, 23.2, 21.2, label="2024-10 vs 최근10년")
-    st.pyplot(fig, clear_figure=True)
-with c2:
-    fig, ax = plt.subplots(figsize=(5,2.6))
-    bullet(ax, 19.8, 19.2, label="2023 연평균 vs 2001–2020", color="#2E86AB")
-    st.pyplot(fig, clear_figure=True)
-with c3:
-    fig, ax = plt.subplots(figsize=(5,2.6))
-    bullet(ax, 22.6, 22.6-2.8, label="서해 2024-10 vs 최근10년", color="#E67E22")
-    st.pyplot(fig, clear_figure=True)
-
-st.subheader("📊 해역별 장·단기 상승과 편차 (예시)")
-regions = ["동해", "서해", "남해"]
-rise_1968_2008 = [1.39, 1.23, 1.27]
-rate_since_2010 = [0.36, 0.54, 0.38]
-anom_2024 = [3.4, 2.8, 1.1]
-cL1, cL2, cL3 = st.columns(3)
-with cL1:
-    fig, ax = plt.subplots(figsize=(4.8,3))
-    lollipop_horizontal(ax, regions, rise_1968_2008, title="장기 상승폭 (1968–2008)", unit="℃")
-    st.pyplot(fig, clear_figure=True)
-with cL2:
-    fig, ax = plt.subplots(figsize=(4.8,3))
-    lollipop_horizontal(ax, regions, rate_since_2010, title="연평균 상승률 (2010~)", unit="℃/년", color="#59A14F")
-    st.pyplot(fig, clear_figure=True)
-with cL3:
-    fig, ax = plt.subplots(figsize=(4.8,3))
-    lollipop_horizontal(ax, regions, anom_2024, title="2024 편차", unit="℃", color="#F28E2B")
-    st.pyplot(fig, clear_figure=True)
-
-st.subheader("2) 지구에 미치는 영향: 극단적 기상 현상의 심화")
-st.markdown("""
-해수면 온도 상승은 대기와 상호작용하며 지구 전체의 기상 시스템을 교란합니다.
-- **더 강력한 태풍**: 따뜻한 바다는 태풍에 더 많은 에너지를 공급합니다.
-- **집중호우 빈발**: 기온이 1℃ 오르면 대기가 머금을 수 있는 수증기량은 약 7% 증가합니다.
-- **혹독한 폭염**: 열돔(Heat Dome) 현상으로 폭염이 장기화됩니다.
-""")
-
-temps2 = np.arange(0, 6)  # 0~5℃
-humidity_increase = 7 * temps2
-figH2, axH2 = plt.subplots(figsize=(7,4))
-axH2.plot(temps2, humidity_increase, lw=3, marker="o")
-axH2.fill_between(temps2, humidity_increase, alpha=0.2)
-axH2.set_xlabel("기온 상승 (℃)")
-axH2.set_ylabel("대기 수증기량 증가율 (%)")
-axH2.set_title("기온 상승에 따른 대기 수증기량 증가")
-for t, v in {1:7,2:14,3:21,4:28,5:35}.items():
-    axH2.scatter(t, v, zorder=5)
-    axH2.annotate(f"+{v:.0f}%", (t, v), textcoords="offset points", xytext=(0,10), ha="center", weight="bold")
-st.pyplot(figH2, clear_figure=True)
-
-st.subheader("3) 고등학생에게 미치는 영향 (예시)")
-st.markdown("**기온 상승 → 학업 성취도 감소** (NBER 연구 요지 인용)")
-
-temps = np.arange(0, 6)
-impact = 100 - (1.8 * temps)  # 1℃ 당 -1.8%
-figC, axC = plt.subplots(figsize=(7,4))
-axC.bar(temps, impact, alpha=0.7, label="구간별 학업 성취도")
-axC.plot(temps, impact, marker="o", lw=2.5, label="추세선 (1℃ 당 -1.8%)")
-axC.set_xlabel("기온 상승 (℃)")
-axC.set_ylabel("학업 성취도 (%)")
-axC.set_title("기온 상승이 학업 성취도에 미치는 영향")
-axC.set_ylim(80, 102)
-for t, v in zip(temps, impact):
-    axC.text(t, v+0.5, f"{v:.1f}%", ha="center", va="bottom", fontsize=9)
-axC.legend()
-st.pyplot(figC, clear_figure=True)
-
-st.markdown("**신체·정신 건강** (예시 수치)")
-years = ["2022년", "2023년", "2024년"]
-patients = [1564, 2818, 3704]
-deaths = [9, 32, 34]
-figM, axM = plt.subplots(figsize=(8, 3.6))
-combo_bar_line(axM, years, patients, deaths)
-axM.set_title("온열질환 환자·사망 추이")
-st.pyplot(figM, clear_figure=True)
-
-cwa, cwb = st.columns(2)
-with cwa:
-    figW1, axW1 = plt.subplots(figsize=(4.2, 4.2))
-    waffle(axW1, 59, title="기후변화를 매우/극도로 우려")
-    st.pyplot(figW1, clear_figure=True)
-with cwb:
-    figW2, axW2 = plt.subplots(figsize=(4.2, 4.2))
-    waffle(axW2, 45, title="일상에 부정적 영향을 받음")
-    st.pyplot(figW2, clear_figure=True)
-
-
-st.subheader("4) 대응과 미래 세대를 위한 제언")
-st.markdown("""
-- **정책**: 모든 학교에 냉방 및 환기 시스템을 현대화하고, 기후 변화에 따른 청소년 건강 영향을 추적하는 세분화된 통계를 구축해야 합니다.
-- **교육**: 기후변화를 정규 교과목으로 편성하고, 문제 해결 중심의 프로젝트 기반 학습을 확대해야 합니다. 또한, '기후테크'와 같은 새로운 진로 분야에 대한 지도가 필요합니다.
-- **청소년 행동**: 플라스틱 저감 캠페인, 기후행동 소송 참여, 지역사회 환경 문제 해결 등 청소년이 주도하는 기후 행동을 적극적으로 지원하고 확산해야 합니다.
-""")
-
-# --- 결론 및 참고 자료 ---
-st.header("IV. 결론")
-st.markdown("""
-대한민국 주변 해수면 온도의 상승은 단순한 해양 문제가 아니라,  
-고등학생들의 건강·학업·생활 전반을 위협하는 **복합 위기**입니다.  
-그러나 교육과 청소년 주도의 기후 행동을 통해 이 위기를 기회로 전환할 수 있습니다.  
-""")
-
-st.header("V. 참고 자료")
-st.markdown("""
-- Goodman, J., & Park, R. J. (2018). *Heat and Learning*. NBER Working Paper.
-- Hickman, C., et al. (2021). Climate anxiety in children and young people and their beliefs about government responses to climate change: a global survey. *The Lancet Planetary Health*.
-- 기상청 보도자료 (2024)  
-- 한국해양수산개발원 연구보고서  
-- Planet03 해양열파 연구 (2021)  
-- Newstree, YTN Science 외 기사 및 연구논문  
-""")
-
-st.markdown(
+# ---------------------------
+# 캐싱된 API 호출 함수 (재시도 포함)
+# ---------------------------
+@st.cache_data(ttl=3600)
+def fetch_openaq_measurements(country: str = "KR", parameter: str = "pm25", limit: int = 1000, days: int = 7):
     """
-    <hr style='border:1px solid #ccc; margin-top:30px; margin-bottom:10px;'/>
-    <div style='text-align: center; padding: 10px; color: gray; font-size: 0.9em;'>
-        미림마이스터고등학교 1학년 4반 1조 · 지속가능한지구사랑해조
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+    OpenAQ measurements API 호출 (간단 재시도 로직 포함).
+    반환: pandas DataFrame (columns: date (datetime), value (float), group (location), latitude, longitude, unit)
+    참고: API docs: https://docs.openaq.org/resources/measurements
+    """
+    base = "https://api.openaq.org/v2/measurements"
+    end_date = datetime.now(timezone.utc)
+    start_date = end_date - timedelta(days=days)
+    params = {
+        "country": country,
+        "parameter": parameter,
+        "date_from": start_date.isoformat(),
+        "date_to": end_date.isoformat(),
+        "limit": limit,
+        "page": 1,
+        "sort": "desc",
+    }
+    attempts = 3
+    for i in range(attempts):
+        try:
+            resp = requests.get(base, params=params, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json().get("results", [])
+                if not data:
+                    return pd.DataFrame()  # empty
+                rows = []
+                for r in data:
+                    # r['date'] contains utc and local; use local if available
+                    dt_local = r.get("date", {}).get("local") or r.get("date", {}).get("utc")
+                    try:
+                        dt = parser.isoparse(dt_local)
+                    except Exception:
+                        dt = None
+                    rows.append({
+                        "date": dt,
+                        "value": r.get("value"),
+                        "group": r.get("location"),
+                        "parameter": r.get("parameter"),
+                        "unit": r.get("unit"),
+                        "latitude": r.get("coordinates", {}).get("latitude"),
+                        "longitude": r.get("coordinates", {}).get("longitude"),
+                        "city": r.get("city"),
+                        "country": r.get("country"),
+                    })
+                df = pd.DataFrame(rows)
+                return df
+            else:
+                # non-200
+                continue
+        except Exception:
+            continue
+    # 실패하면 빈 DF returned to signal fallback required
+    return pd.DataFrame()
+
+@st.cache_data(ttl=3600)
+def fetch_worldbank_pm25(country_codes: list[str] = ["KOR","CHN","IND"], years: list[int] = [2015,2018,2020,2022]):
+    """
+    World Bank WDI에서 EN.ATM.PM25.MC.M3 지표(연평균 PM2.5) 간단 조회 (REST API)
+    참고: https://data.worldbank.org/indicator/EN.ATM.PM25.MC.M3
+    This uses the World Bank API endpoint for indicators:
+    http://api.worldbank.org/v2/country/{country}/indicator/{indicator}?date=YYYY:YYYY&format=json&per_page=100
+    """
+    indicator = "EN.ATM.PM25.MC.M3"
+    rows = []
+    for cc in country_codes:
+        # Request for a range of years
+        year_min = min(years)
+        year_max = max(years)
+        url = f"http://api.worldbank.org/v2/country/{cc}/indicator/{indicator}"
+        params = {"date": f"{year_min}:{year_max}", "format":"json", "per_page":100}
+        try:
+            resp = requests.get(url, params=params, timeout=15)
+            if resp.status_code == 200:
+                j = resp.json()
+                if isinstance(j, list) and len(j) >= 2:
+                    for entry in j[1]:
+                        year = int(entry.get("date"))
+                        val = entry.get("value")
+                        if val is not None:
+                            rows.append({
+                                "country": entry.get("country", {}).get("value"),
+                                "countryiso3": cc,
+                                "year": year,
+                                "value": float(val),
+                            })
+        except Exception:
+            continue
+    if rows:
+        df = pd.DataFrame(rows)
+        return df
+    else:
+        return pd.DataFrame()
+
+# ---------------------------
+# 예시 데이터 (API 실패 시 대체)
+# ---------------------------
+def generate_example_openaq_example():
+    """
+    API 실패 또는 빈 응답 시 사용할 예시 데이터 (한국의 가상의 관측소 3개, 7일치 hourly)
+    표준화: date, value, group, latitude, longitude, unit
+    """
+    now = datetime.now(SEOUL_TZ)
+    end = now
+    start = end - timedelta(days=6)
+    periods = 24 * 7
+    times = pd.date_range(start=start - timedelta(hours=start.hour, minutes=start.minute, seconds=start.second),
+                          periods=periods, freq="H", tz=SEOUL_TZ)
+    groups = ["교실_A(실내)", "교실_B(실내)", "관측소_서울시_중구(실외)"]
+    records = []
+    rng = np.random.default_rng(42)
+    for g in groups:
+        base = 10 if "실내" in g else 25
+        for t in times:
+            # introduce daily pattern + noise
+            hour = t.hour
+            diurnal = 5 * np.sin((hour / 24) * 2 * np.pi)
+            val = max(0.5, base + diurnal + rng.normal(0, 5))
+            records.append({
+                "date": t.to_pydatetime(),
+                "value": round(float(val),2),
+                "group": g,
+                "unit": "µg/m³",
+                "latitude": 37.56 + rng.normal(0, 0.005),
+                "longitude": 126.97 + rng.normal(0, 0.005),
+                "city":"Seoul",
+                "country":"KR"
+            })
+    df = pd.DataFrame(records)
+    return df
+
+def generate_user_dataset_from_prompt():
+    """
+    사용자 입력(프롬프트 본문)을 바탕으로 생성한 '학급별 실내 vs 실외 PM2.5' 예시 데이터.
+    - 5교시(08:00-15:00) 동안 30분 간격 측정, 5일치(평일)
+    - groups: '교실1', '교실2', '가정(실내)', '지역(실외)'
+    표준화: date, value, group
+    """
+    # school days: 최근 주중 5일 (서울 기준)
+    today = datetime.now(SEOUL_TZ).date()
+    # find last Monday
+    td = today
+    # ensure weekday 0-4
+    # choose last 7 days and then pick five most recent weekdays
+    days = []
+    for d in range(1, 15):
+        candidate = today - timedelta(days=d)
+        if candidate.weekday() < 5:  # Mon-Fri
+            days.append(candidate)
+        if len(days) >= 5:
+            break
+    days = sorted(days)
+    records = []
+    rng = np.random.default_rng(123)
+    for day in days:
+        for hh in range(8, 16):  # 08:00 - 15:00
+            for minute in [0,30]:
+                dt = datetime(day.year, day.month, day.day, hh, minute, tzinfo=SEOUL_TZ)
+                # generate values
+                outdoor = max(5, 20 + 10*np.sin((hh-8)/8*2*np.pi) + rng.normal(0,3))
+                classroom1 = max(5, outdoor*0.6 + 5 + rng.normal(0,2))
+                classroom2 = max(5, outdoor*0.8 + rng.normal(0,2))
+                home = max(5, outdoor*0.9 + 3 + rng.normal(0,2))
+                records += [
+                    {"date": dt, "value": round(float(classroom1),2), "group":"교실 1 (실내)"},
+                    {"date": dt, "value": round(float(classroom2),2), "group":"교실 2 (실내)"},
+                    {"date": dt, "value": round(float(home),2), "group":"가정 (실내)"},
+                    {"date": dt, "value": round(float(outdoor),2), "group":"지역 관측소 (실외)"},
+                ]
+    df = pd.DataFrame(records)
+    return df
+
+# ---------------------------
+# 유틸: 미래 데이터 제거 / 표준화 / 전처리
+# ---------------------------
+def preprocess_df(df: pd.DataFrame, date_col: str = "date", value_col: str = "value", group_col: str = "group"):
+    """
+    - date 형변환
+    - 결측치 처리 (value 결측은 제거)
+    - 중복 제거
+    - 미래 데이터(서울 자정 이후) 제거
+    - 표준화 컬럼명: date, value, group (group optional)
+    """
+    df = df.copy()
+    # rename if necessary
+    if date_col != "date":
+        df = df.rename(columns={date_col: "date"})
+    if value_col != "value":
+        df = df.rename(columns={value_col: "value"})
+    if group_col != "group" and group_col in df.columns:
+        df = df.rename(columns={group_col: "group"})
+    # date parsing
+    if not pd.api.types.is_datetime64_any_dtype(df["date"]):
+        try:
+            df["date"] = pd.to_datetime(df["date"])
+        except Exception:
+            # attempt manual parsing with dateutil
+            df["date"] = df["date"].apply(lambda x: parser.parse(x) if pd.notnull(x) else pd.NaT)
+    # drop rows with missing value/date
+    df = df.dropna(subset=["date","value"])
+    # ensure numeric
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["value"])
+    # remove duplicates
+    df = df.drop_duplicates()
+    # remove future data: compare date.date() > seoul_today_date() -> drop
+    today = seoul_today_date()
+    # ensure timezone aware handling: convert to SEOUL_TZ if naive assume local
+    def _date_to_seoul(d):
+        if d.tzinfo is None:
+            return SEOUL_TZ.localize(d)
+        else:
+            return d.astimezone(SEOUL_TZ)
+    df["date"] = df["date"].apply(_date_to_seoul)
+    df = df[df["date"].dt.date <= today]
+    # sort
+    df = df.sort_values("date").reset_index(drop=True)
+    # keep only relevant columns and fill group if missing
+    if "group" not in df.columns:
+        df["group"] = "전체"
+    # standard columns preserved: date, value, group
+    return df[["date","value","group"] + [c for c in df.columns if c not in ["date","value","group"]]]
+
+# ---------------------------
+# UI: 사이드바 기본
+# ---------------------------
+st.sidebar.header("데시보드 설정")
+# 날짜 범위 필터 기본값 (공개 데이터용)
+default_days = st.sidebar.slider("공개 데이터 조회 기간(일)", min_value=1, max_value=30, value=7)
+
+# ---------------------------
+# 메인: 탭 구성 (공개 데이터 / 사용자 입력)
+# ---------------------------
+tabs = st.tabs(["공식 공개 데이터 대시보드", "사용자 입력 기반 대시보드 (보고서 기반 예시)"])
+
+# ---------------------------
+# 탭 1: 공개 데이터 대시보드
+# ---------------------------
+with tabs[0]:
+    st.header("공식 공개 데이터 대시보드 (OpenAQ + World Bank 예시)")
+    st.markdown(
+        """
+        **설명:** OpenAQ의 관측치(실시간/역사적)와 World Bank의 연평균 PM2.5(연도별)를 사용해 실외 공기질을 시각화합니다.
+        - API 호출 실패 시, 예시 데이터로 자동 대체됩니다(화면 안내 표시).
+        - 출처는 코드 주석에 명시되어 있습니다.
+        """
+    )
+    col1, col2 = st.columns([3,1])
+    with col2:
+        st.subheader("설정")
+        country_code = st.selectbox("조회 국가 코드 선택", options=["KR","IN","CN","US","FI"], index=0, help="ISO 3166-1 alpha-2")
+        parameter = st.selectbox("측정 파라미터", options=["pm25","pm10","no2","o3"], index=0)
+        limit = st.slider("최대 레코드 수", min_value=100, max_value=5000, value=1000, step=100)
+        st.caption("OpenAQ API 문서: https://docs.openaq.org/resources/measurements")
+
+    # Fetch OpenAQ
+    with st.spinner("OpenAQ 데이터 가져오는 중..."):
+        df_openaq_raw = fetch_openaq_measurements(country=country_code, parameter=parameter, limit=limit, days=default_days)
+
+    # If API returned empty -> show fallback with example and note
+    if df_openaq_raw.empty:
+        st.warning("공개 API(OpenAQ) 호출에 실패하거나 데이터가 없습니다. 예시(대체) 데이터를 사용합니다. (원본 API: https://api.openaq.org/)")
+        df_op = generate_example_openaq_example()
+    else:
+        df_op = df_openaq_raw.copy()
+
+    # Preprocess
+    df_op = preprocess_df(df_op, date_col="date", value_col="value", group_col="group")
+
+    st.subheader("원시/전처리된 표 (OpenAQ 기반)")
+    st.write("아래 표는 전처리(결측/중복/미래 데이터 제거)된 결과입니다.")
+    st.dataframe(df_op.head(200))
+
+    # CSV 다운로드
+    csv_buf = io.BytesIO()
+    df_op.to_csv(csv_buf, index=False)
+    csv_buf.seek(0)
+    st.download_button("전처리된 OpenAQ 데이터 CSV 다운로드", data=csv_buf, file_name="openaq_preprocessed.csv", mime="text/csv")
+
+    # 시계열: 주요 관측소별 PM2.5 (혹은 선택한 parameter)
+    st.subheader("시계열: 관측소별 값")
+    # allow user to choose group(s)
+    groups = df_op["group"].unique().tolist()
+    sel_groups = st.multiselect("관측소(그룹) 선택", options=groups, default=groups[:5])
+    if not sel_groups:
+        st.info("관측소를 선택하세요.")
+    else:
+        df_ts = df_op[df_op["group"].isin(sel_groups)]
+        if df_ts.empty:
+            st.info("선택된 관측소에 데이터가 없습니다.")
+        else:
+            fig = px.line(df_ts, x="date", y="value", color="group", labels={"date":"일시","value":"농도 (µg/m³)","group":"관측소"})
+            fig.update_layout(title=f"{parameter.upper()} 시계열 ({country_code})", legend_title="관측소", font_family="Pretendard")
+            st.plotly_chart(fig, use_container_width=True)
+
+    # 지도: 관측소 위치 (있을 때)
+    st.subheader("지도: 관측소 위치 (있을 경우)")
+    if "latitude" in df_op.columns and "longitude" in df_op.columns:
+        if "latitude" in df_op.columns and df_op["latitude"].notna().any():
+            # take latest value per group and plot
+            latest = df_op.sort_values("date").groupby("group").last().dropna(subset=["latitude","longitude"]).reset_index()
+            if latest.empty:
+                st.info("지도용 좌표 데이터가 없습니다.")
+            else:
+                mdf = latest.rename(columns={"latitude":"lat","longitude":"lon","value":"농도"})
+                st.map(mdf[["lat","lon"]])
+                st.table(mdf[["group","농도"]].assign(설명="마지막 관측치"))
+        else:
+            st.info("좌표 데이터가 포함되어 있지 않아 지도를 표시할 수 없습니다.")
+    else:
+        st.info("좌표 데이터가 포함되어 있지 않아 지도를 표시할 수 없습니다.")
+
+    # World Bank 연평균 PM2.5 (간단 조회)
+    st.subheader("World Bank: 연평균 PM2.5 (예시)")
+    try:
+        wb_countries = st.multiselect("국가(ISO3) 선택 (World Bank)", options=["KOR","CHN","IND","FIN","ISL","USA"], default=["KOR","CHN","IND"])
+        wb_years = st.multiselect("연도 범위 선택 (예시)", options=[2015,2016,2017,2018,2019,2020,2021,2022,2023], default=[2018,2020,2022])
+        if wb_countries:
+            df_wb = fetch_worldbank_pm25(country_codes=wb_countries, years=wb_years)
+            if df_wb.empty:
+                st.info("World Bank 데이터가 확보되지 않았습니다.")
+            else:
+                st.dataframe(df_wb.head(200))
+                fig2 = px.line(df_wb, x="year", y="value", color="country", markers=True, labels={"year":"연도","value":"연평균 PM2.5 (µg/m³)","country":"국가"})
+                fig2.update_layout(title="World Bank: 연평균 PM2.5", font_family="Pretendard")
+                st.plotly_chart(fig2, use_container_width=True)
+    except Exception:
+        st.info("World Bank API 호출 중 문제가 발생했습니다.")
+
+    st.markdown("---")
+    st.caption("데이터 출처 예: OpenAQ (https://api.openaq.org/), World Bank (https://data.worldbank.org/indicator/EN.ATM.PM25.MC.M3), WHO Air Quality Database (https://www.who.int/data/gho/data/themes/air-pollution/who-air-quality-database)")
+
+# ---------------------------
+# 탭 2: 사용자 입력 기반 대시보드 (프롬프트 텍스트 사용)
+# ---------------------------
+with tabs[1]:
+    st.header("사용자 입력 기반 대시보드 — 보고서 본문(프롬프트) 기반 예시")
+    st.markdown(
+        """
+        제공하신 보고서(문서 본문)를 바탕으로 **학교·가정의 실내 공기질(교실별 PM2.5)** 와 **지역(실외)** 을 비교하는 예시 데이터를 자동 생성하여 시각화합니다.
+        - 앱 실행 중 파일 업로드나 추가 텍스트 입력을 요구하지 않습니다.
+        - 사이드바 옵션은 데이터 특성에 맞춰 자동 구성됩니다.
+        """
+    )
+    st.subheader("데이터 요약 (프롬프트 기반 생성)")
+    st.write("원문에서 제안된 측정 항목: 교실별 PM2.5, 이산화탄소, 환기시간대별 변화 등. 여기서는 PM2.5(실내 vs 실외)를 시뮬레이션했습니다.")
+    # Generate user dataset from prompt
+    df_user_raw = generate_user_dataset_from_prompt()
+    df_user = preprocess_df(df_user_raw, date_col="date", value_col="value", group_col="group")
+
+    st.subheader("전처리된 사용자 데이터 (보고서 기반 예시)")
+    st.dataframe(df_user.head(200))
+    # CSV 다운로드
+    buf2 = io.BytesIO()
+    df_user.to_csv(buf2, index=False)
+    buf2.seek(0)
+    st.download_button("전처리된 사용자 데이터 CSV 다운로드", data=buf2, file_name="user_data_preprocessed.csv", mime="text/csv")
+
+    # 자동 구성된 사이드바 옵션 (기간 필터, 스무딩, 단위)
+    st.sidebar.subheader("사용자 데이터 옵션 (자동 구성)")
+    # date range from data
+    min_dt = df_user["date"].min()
+    max_dt = df_user["date"].max()
+    sel_range = st.sidebar.date_input("기간 필터 (사용자 데이터)", value=(min_dt.date(), max_dt.date()), min_value=min_dt.date(), max_value=max_dt.date())
+    smoothing = st.sidebar.slider("이동평균 스무딩(간격, 관측치 단위)", min_value=1, max_value=9, value=3)
+    show_points = st.sidebar.checkbox("측정점 표시", value=False)
+    group_options = df_user["group"].unique().tolist()
+    selected_groups = st.sidebar.multiselect("그룹 선택 (사용자 데이터)", options=group_options, default=group_options)
+
+    # apply filters
+    dr_start = datetime.combine(sel_range[0], datetime.min.time()).replace(tzinfo=SEOUL_TZ)
+    dr_end = datetime.combine(sel_range[1], datetime.max.time()).replace(tzinfo=SEOUL_TZ)
+    df_user_f = df_user[(df_user["date"] >= dr_start) & (df_user["date"] <= dr_end) & (df_user["group"].isin(selected_groups))].copy()
+
+    if df_user_f.empty:
+        st.info("선택된 조건에 해당하는 데이터가 없습니다.")
+    else:
+        # Time series with smoothing
+        st.subheader("시계열(교실별 실내 vs 실외) — PM2.5")
+        # apply moving average per group
+        df_user_f["date_str"] = df_user_f["date"].dt.strftime("%Y-%m-%d %H:%M")
+        df_plot = df_user_f.sort_values("date")
+        if smoothing > 1:
+            df_plot = df_plot.groupby("group").apply(lambda g: g.assign(value_s=g["value"].rolling(window=smoothing, min_periods=1).mean())).reset_index(drop=True)
+            y_col = "value_s"
+            ylabel = f"농도 (µg/m³) — {smoothing}시점 이동평균"
+        else:
+            y_col = "value"
+            ylabel = "농도 (µg/m³)"
+        fig3 = px.line(df_plot, x="date", y=y_col, color="group", labels={"date":"일시","value":"농도 (µg/m³)","value_s":"농도 (스무딩)","group":"그룹"})
+        if show_points:
+            fig3.update_traces(mode="lines+markers")
+        fig3.update_layout(title="교실별(실내) vs 지역(실외) PM2.5 추이", font_family="Pretendard", yaxis_title=ylabel)
+        st.plotly_chart(fig3, use_container_width=True)
+
+        # 비교막대: 같은 시간대(예: 점심시간 12:00) 평균 비교
+        st.subheader("비교: 특정 시간대 평균 (예: 12:00 ~ 13:00)")
+        # aggregate hourly by group for selected date range
+        df_user_f["hour"] = df_user_f["date"].dt.hour
+        lunch_df = df_user_f[(df_user_f["hour"] >= 12) & (df_user_f["hour"] < 13)]
+        if lunch_df.empty:
+            st.info("선택된 기간에 12시대 데이터가 없습니다.")
+        else:
+            agg = lunch_df.groupby("group")["value"].mean().reset_index().rename(columns={"value":"평균 PM2.5 (µg/m³)"})
+            fig4 = px.bar(agg, x="group", y="평균 PM2.5 (µg/m³)", labels={"group":"그룹"})
+            fig4.update_layout(title="점심시간대(12시~13시) 평균 PM2.5 비교", font_family="Pretendard")
+            st.plotly_chart(fig4, use_container_width=True)
+            st.table(agg)
+
+    st.markdown("---")
+    st.subheader("실행 도움말 / 권장 활용법")
+    st.markdown(
