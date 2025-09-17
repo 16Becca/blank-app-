@@ -30,12 +30,12 @@ except:
 # 유틸 함수
 # -----------------------------
 @st.cache_data
-def preprocess_df(df: pd.DataFrame) -> pd.DataFrame:
+def preprocess_df(df: pd.DataFrame, date_col="date", value_col="value", group_col="group") -> pd.DataFrame:
     """데이터 전처리: 날짜 변환, 미래 데이터 제거"""
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    if date_col in df.columns:
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
         today = pd.Timestamp(datetime.now().date())
-        df = df[df["date"] <= today]
+        df = df[df[date_col] <= today]
     df = df.dropna().drop_duplicates()
     return df
 
@@ -131,8 +131,13 @@ with tabs[0]:
 with tabs[1]:
     st.header("사용자 입력 기반 대시보드 — 실내 vs 실외 공기질 비교")
 
+    # 이미지 추가
+    st.subheader("실내 오염원 예시 그림")
+    st.image("0a05e60d-b696-425b-9011-6c8ca5c29310.png", use_column_width=True)
+
+    # 데이터 생성 & 전처리
     df_user_raw = generate_user_dataset_from_prompt()
-    df_user = preprocess_df(df_user_raw)
+    df_user = preprocess_df(df_user_raw, date_col="date", value_col="value", group_col="group")
 
     # 실내/실외 카테고리 분류
     df_user["category"] = df_user["group"].apply(lambda g: "실내" if "실내" in g else "실외")
